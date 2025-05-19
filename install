@@ -1,0 +1,186 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Timestamped logs
+log() { echo "$(date +'%Y-%m-%d %H:%M:%S') $*"; }
+
+if [[ "$#" -ne 3 ]]; then
+  log "Usage: $0 <openrc_file> <tag> <ssh_key_name>"
+  exit 1
+fi
+
+OPENRC=$1
+TAG=$2
+SSH_KEY_NAME=$3
+KEY_FILE="$HOME/.ssh/$SSH_KEY_NAME"
+STORAGE_DIR="${TAG}_storage"
+mkdir -p "$STORAGE_DIR"
+
+log "Starting the deployment setup of ${TAG} using key ${OPENRC} for the access credentials."
+
+log "Sourcing the Cleura OpenStack access credentials."
+if [[ ! -f "$OPENRC" ]]; then
+  log "ERROR: Credential file '$OPENRC' not found."
+  exit 1
+fi
+source "$OPENRC"
+
+log "Verifying the OpenStack connectivity if its working or not."
+if ! openstack token issue &>/dev/null; then
+  log "ERROR: Couldnt authenticate to OpenStack."
+  exit 1
+fi
+
+log "Checking SSH key '$SSH_KEY_NAME'."
+if [[ ! -f "$KEY_FILE" ]]; then
+  log "ERROR: SSH key '$KEY_FILE' not found."
+  exit 1
+fi
+log "Using SSH key at $KEY_FILE"
+
+KEYPAIR=key_${TAG}
+if openstack keypair show "$KEYPAIR" &>/dev/null; then
+  log "Deleting existing keypair $KEYPAIR."
+  openstack keypair delete "$KEYPAIR"
+fi
+log "Adding keypair $KEYPAIR from $KEY_FILE.pub."
+openstack keypair create --public-key "$KEY_FILE.pub" "$KEYPAIR" >/dev/null
+
+EXT_NET=$(openstack network list --external -f value -c Name | head -n1)
+log "External network for FIPs: $EXT_NET"
+
+log "Checking floating IP availability."
+mapfile -t free_ips < <(openstack floating ip list --status DOWN --network "$EXT_NET" -f value -c Floating_IP_Address)
+count=${#free_ips[@]}
+log "Unassigned FIPs: $count"
+if (( count < 2 )); then
+  needed=$((2-count))
+  log "Allocating $needed new floating IP(s)."
+  for i in $(seq 1 $needed); do
+    openstack floating ip create "$EXT_NET" --tag "$TAG" >/dev/null
+  done
+  log "Floating IP allocation complete."
+fi
+mapfile -t ips < <(openstack floating ip list --status DOWN --network "$EXT_NET" -f value -c Floating_IP_Address | head -n2)
+BASTION_IP=${ips[0]}
+PROXY_IP=${ips[1]}
+log "Using Bastion IP: $BASTION_IP, Proxy IP: $PROXY_IP"
+
+NET=net_${TAG}
+SUBNET=subnet_${TAG}
+CIDR=192.168.77.0/24
+ROUTER=router_${TAG}
+
+log "Checking network $NET."
+if openstack network show "$NET" &>/dev/null; then
+  log "$NET exists."
+else
+  log "Creating network $NET."
+  openstack network create --tag "$TAG" "$NET" >/dev/null
+  log "$NET created."
+fi
+
+log "Checking subnet $SUBNET."
+if openstack subnet show "$SUBNET" &>/dev/null; then
+  log "$SUBNET exists."
+else
+  log "Creating subnet $SUBNET ($CIDR)."
+  openstack subnet create --network "$NET" --subnet-range "$CIDR" --tag "$TAG" "$SUBNET" >/dev/null
+  log "$SUBNET created."
+fi
+
+log "Checking router $ROUTER."
+if openstack router show "$ROUTER" &>/dev/null; then
+  log "$ROUTER exists."
+else
+  log "Creating router $ROUTER."
+  openstack router create --tag "$TAG" "$ROUTER" >/dev/null
+  log "$ROUTER created."
+fi
+
+log "Attaching gateway and subnet to $ROUTER."
+openstack router set --external-gateway "$EXT_NET" "$ROUTER" >/dev/null || true
+openstack router add subnet "$ROUTER" "$SUBNET" >/dev/null || true
+log "Gateway and subnet connected to $ROUTER."
+
+for role in bastion proxy nodes; do
+  sg=sg_${role}_${TAG}
+  log "Checking security group $sg."
+  if openstack security group show "$sg" &>/dev/null; then
+    log "$sg exists."
+  else
+    log "Creating security group $sg."
+    openstack security group create --description "$role" --tag "$TAG" "$sg" >/dev/null
+    log "$sg created."
+  fi
+done
+
+log "Adding security group rules."
+openstack security group rule create sg_bastion_${TAG} --protocol tcp --dst-port 22 --ingress --remote-ip 0.0.0.0/0 >/dev/null || true
+openstack security group rule create sg_proxy_${TAG} --protocol tcp --dst-port 5000 --ingress --remote-ip 0.0.0.0/0 >/dev/null || true
+openstack security group rule create sg_proxy_${TAG} --protocol udp --dst-port 6000 --ingress --remote-ip 0.0.0.0/0 >/dev/null || true
+
+log "Detecting an Ubuntu 20.04 image."
+match=$(openstack image list --status active -f json | jq -r '.[] | select(.Name|test("20\\.04";"i")) | "\(.ID)\t\(.Name)"' | head -n1)
+if [[ -z "$match" ]]; then
+  log "ERROR: Could not find any image with '20.04'"
+  exit 1
+fi
+IMAGE_ID=$(echo "$match" | cut -f1)
+IMAGE_NAME=$(echo "$match" | cut -f2-)
+log "Image selected: $IMAGE_NAME (ID: $IMAGE_ID)"
+
+FLAVOR=b.1c2gb
+if ! openstack flavor show "$FLAVOR" &>/dev/null; then
+  log "ERROR: Flavor $FLAVOR not found."
+  exit 1
+fi
+log "Flavor selected: $FLAVOR"
+
+disk=$(openstack flavor show "$FLAVOR" -f value -c disk)
+if [[ "$disk" -eq 0 ]]; then
+  BOOT_OPTS="--image $IMAGE_ID --boot-from-volume 10"
+  log "Flavor has no disk, using boot-from-volume with image."
+else
+  BOOT_OPTS="--image $IMAGE_ID"
+  log "Flavor has local disk, using image only."
+fi
+
+create_server() {
+  local name=$1; local sg=$2; local fip=${3:-}
+  if openstack server show "$name" &>/dev/null; then
+    log "$name exists."
+  else
+    log "Creating $name."
+    openstack server create $BOOT_OPTS --flavor "$FLAVOR" \
+      --key-name "$KEYPAIR" --network "$NET" --security-group "$sg" \
+      --wait "$name" >/dev/null
+    log "$name created."
+  fi
+  if [[ -n "$fip" ]]; then
+    openstack server add floating ip "$name" "$fip" >/dev/null || true
+    log "Assigned $fip to $name."
+  fi
+}
+
+count=$(head -n1 servers.conf 2>/dev/null || echo 3)
+log "Launching $count service nodes (count=$count)."
+create_server bastion_${TAG} sg_bastion_${TAG} $BASTION_IP
+create_server proxy_${TAG} sg_proxy_${TAG} $PROXY_IP
+for i in $(seq 1 "$count"); do create_server service_${TAG}_$i sg_nodes_${TAG}; done
+
+log "Waiting for all servers to reach ACTIVE."
+for name in bastion_${TAG} proxy_${TAG} $(seq -f service_${TAG}_%g 1 $count); do
+  log "Checking status for $name"
+  while true; do
+    status=$(openstack server show "$name" -f value -c status)
+    if [[ "$status" == "ACTIVE" ]]; then
+      log "$name is ACTIVE."
+      break
+    fi
+    sleep 5
+  done
+done
+
+log "All servers are ACTIVE. Deployment complete."
