@@ -1,131 +1,103 @@
 #!/bin/bash
 
-if [ "$#" -ne 2 ]; then
-    echo "Usage: $0 <openrc_file> <tag>"
+set -euo pipefail
+
+log() {
+    echo "$(date +'%Y-%m-%d %H:%M:%S') $*"
+}
+
+if [[ "$#" -lt 2 ]]; then
+    log "Usage: $0 <openrc> <tag>"
     exit 1
 fi
 
-OPENRC_FILE="$1"
+OPENRC="$1"
 TAG="$2"
 
-SCRIPT_DIR=$(cd $(dirname "$0") && pwd)
+source "$OPENRC"
 
-log() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"
-}
+log "Cleaning up $TAG using $OPENRC"
 
-log "Starting cleanup for resources tagged with: $TAG"
+KEY_NAME="${TAG}_key"
+NET_NAME="${TAG}_network"
+SUBNET_NAME="${TAG}_subnet"
+ROUTER_NAME="${TAG}_router"
+SG_BASTION="sg_bastion_${TAG}"
+SG_PROXY="sg_proxy_${TAG}"
+SG_NODES="sg_nodes_${TAG}"
 
-if [ ! -f "$OPENRC_FILE" ]; then log "ERROR: OpenStack RC file '$OPENRC_FILE' not found."; exit 1; fi
-log "Sourcing OpenStack RC file: $OPENRC_FILE"
-
-source "$OPENRC_FILE"
-
-KEY_NAME="key_${TAG}"
-NETWORK_NAME="net_${TAG}"
-SUBNET_NAME="subnet_${TAG}"
-ROUTER_NAME="router_${TAG}"
-SG_BASTION_NAME="sg_bastion_${TAG}"
-SG_PROXY_NAME="sg_proxy_${TAG}"
-SG_NODES_NAME="sg_nodes_${TAG}"
-
-log "Identifying servers with tag '$TAG' or name pattern *_$TAG..."
-SERVER_IDS_BY_TAG=$(openstack server list --tag "$TAG" -f value -c ID 2>/dev/null)
-SERVER_IDS_BY_NAME=$(openstack server list --name "_${TAG}" -f value -c ID 2>/dev/null) # Catches bastion_TAG, proxy_TAG, service_TAG_N
-
-COMBINED_SERVER_IDS=$(echo -e "${SERVER_IDS_BY_TAG}\n${SERVER_IDS_BY_NAME}" | sort -u | grep -v '^$')
-
-if [ -n "$COMBINED_SERVER_IDS" ]; then
-    log "Found servers to delete: $COMBINED_SERVER_IDS"
-    for SERVER_ID in $COMBINED_SERVER_IDS; do
-        SERVER_NAME=$(openstack server show "$SERVER_ID" -f value -c name 2>/dev/null || echo "$SERVER_ID") 
-        log "Processing server $SERVER_NAME ($SERVER_ID)..."
-        
-        log "Detaching any floating IPs from server $SERVER_NAME ($SERVER_ID)..."
-        FIPS_ON_SERVER=$(openstack server show "$SERVER_ID" -f json 2>/dev/null | jq -r '.addresses | to_entries[] | .value[] | select(."OS-EXT-IPS:type" == "floating") | .addr' 2>/dev/null)
-        for FIP in $FIPS_ON_SERVER; do
-            log "Detaching FIP $FIP from $SERVER_NAME"
-            openstack server remove floating ip "$SERVER_ID" "$FIP" > /dev/null || log "Error: Failed to detach FIP $FIP from $SERVER_NAME"
-        done
-        
-        log "Deleting server $SERVER_NAME ($SERVER_ID)..."
-        openstack server delete --wait "$SERVER_ID" > /dev/null || log "Error: Failed to delete server $SERVER_ID"
+SERVER_IDS=$(openstack server list --name "^${TAG}_" -f value -c ID)
+if [[ -n "$SERVER_IDS" ]]; then
+    log "Deleting servers: $SERVER_IDS"
+    openstack server delete --wait $SERVER_IDS || true
+    log "Waiting for servers to be deleted..."
+    while openstack server list --name "^${TAG}_" -f value -c ID | grep -q .; do
+        sleep 5
     done
     log "Servers deleted."
 else
-    log "No servers found with tag '$TAG' or matching name pattern *_$TAG."
+    log "No servers found for $TAG"
 fi
 
-log "Deleting Floating IPs with tag '$TAG'..."
-FIP_IDS=$(openstack floating ip list --tag "$TAG" -f value -c ID 2>/dev/null)
-if [ -n "$FIP_IDS" ]; then
-    for FIP_ID in $FIP_IDS; do
-        FIP_ADDR=$(openstack floating ip show "$FIP_ID" -f value -c floating_ip_address 2>/dev/null || echo "$FIP_ID")
-        log "Deleting Floating IP $FIP_ADDR ($FIP_ID)..."
-        openstack floating ip delete "$FIP_ID" > /dev/null || log "Error: Failed to delete FIP $FIP_ID"
+FIPS=$(openstack floating ip list --tag "$TAG" -f value -c "Floating IP Address")
+if [[ -n "$FIPS" ]]; then
+    log "Deleting floating IPs: $FIPS"
+    for FIP in $FIPS; do
+        openstack floating ip delete "$FIP" || true
     done
-    log "Tagged Floating IPs deleted."
-else
-    log "No Floating IPs found with tag '$TAG'."
+    log "Floating IPs deleted."
 fi
 
-if openstack router show "$ROUTER_NAME" > /dev/null 2>&1; then
-    log "Detaching subnet '$SUBNET_NAME' from router '$ROUTER_NAME'..."
-    openstack router remove subnet "$ROUTER_NAME" "$SUBNET_NAME" > /dev/null || log "Error: Failed to remove subnet from router."
-    
-    PORTS_ON_ROUTER=$(openstack port list --router "$ROUTER_NAME" --network "$NETWORK_NAME" -f value -c id 2>/dev/null)
-    for PORT_ID in $PORTS_ON_ROUTER; do
-        log "Detaching port $PORT_ID (interface to $SUBNET_NAME) from router $ROUTER_NAME"
-        openstack router remove port "$ROUTER_NAME" "$PORT_ID" > /dev/null || log "Error: Could not remove port $PORT_ID from router $ROUTER_NAME"
-    done
-    
-    log "Clearing external gateway from router '$ROUTER_NAME'..."
-    openstack router unset --external-gateway "$ROUTER_NAME" > /dev/null || log "Error: Failed to unset gateway."
-    
-    log "Deleting router '$ROUTER_NAME'..."
-    openstack router delete "$ROUTER_NAME" > /dev/null || log "Error: Failed to delete router $ROUTER_NAME"
-else
-    log "Router '$ROUTER_NAME' not found."
+log "Looking for volumes tagged \"$TAG\"…"
+openstack volume list --name "${TAG}_node*"
+openstack volume list --long -f value -c ID -c Name -c Status -c Tags \
+| awk -v tag="$TAG" '$0 ~ tag { print $1 }' \
+| xargs -r -n1 sh -c 'for vol; do
+      openstack volume delete "$vol" >/dev/null
+  done' _ 
+
+log "Volume cleanup complete."
+
+ROUTER_ID=$(openstack router show "$ROUTER_NAME" -f value -c id 2>/dev/null || echo "")
+SUBNET_ID=$(openstack subnet show "$SUBNET_NAME" -f value -c id 2>/dev/null || echo "")
+if [[ -n "$ROUTER_ID" && -n "$SUBNET_ID" ]]; then
+    log "Detaching subnet from router..."
+    openstack router remove subnet "$ROUTER_NAME" "$SUBNET_NAME" || true
 fi
 
-if openstack subnet show "$SUBNET_NAME" > /dev/null 2>&1; then
-    log "Deleting subnet '$SUBNET_NAME'..."
-    openstack subnet delete "$SUBNET_NAME" > /dev/null || log "Error: Failed to delete subnet $SUBNET_NAME"
-else
-    log "Subnet '$SUBNET_NAME' not found."
+if openstack router show "$ROUTER_NAME" &>/dev/null; then
+    log "Deleting router $ROUTER_NAME"
+    openstack router delete "$ROUTER_NAME" || true
 fi
 
-if openstack network show "$NETWORK_NAME" > /dev/null 2>&1; then
-    log "Deleting network '$NETWORK_NAME'..."
-    openstack network delete "$NETWORK_NAME" > /dev/null || log "Error: Failed to delete network $NETWORK_NAME"
-else
-    log "Network '$NETWORK_NAME' not found."
+if openstack subnet show "$SUBNET_NAME" &>/dev/null; then
+    log "Deleting subnet $SUBNET_NAME"
+    openstack subnet delete "$SUBNET_NAME" || true
 fi
 
-SGS_TO_DELETE=("$SG_BASTION_NAME" "$SG_PROXY_NAME" "$SG_NODES_NAME")
-for SG_NAME_DEL in "${SGS_TO_DELETE[@]}"; do
-    if openstack security group show "$SG_NAME_DEL" > /dev/null 2>&1; then
-        log "Deleting Security Group $SG_NAME_DEL..."
-        openstack security group delete "$SG_NAME_DEL" > /dev/null || log "Error: Failed to delete SG $SG_NAME_DEL"
-    else
-        log "Security Group '$SG_NAME_DEL' not found."
+if openstack network show "$NET_NAME" &>/dev/null; then
+    log "Deleting network $NET_NAME"
+    openstack network delete "$NET_NAME" || true
+fi
+
+for SG in "$SG_BASTION" "$SG_PROXY" "$SG_NODES"; do
+    if openstack security group show "$SG" &>/dev/null; then
+        log "Deleting security group $SG"
+        openstack security group delete "$SG" || true
     fi
 done
-SG_IDS_BY_TAG=$(openstack security group list --tag "$TAG" -f value -c ID 2>/dev/null)
-if [ -n "$SG_IDS_BY_TAG" ]; then
-    log "Deleting any remaining SGs with tag '$TAG'..."
-    for SG_ID_TAG in $SG_IDS_BY_TAG; do
-        SG_NAME_TAG_DEL=$(openstack security group show "$SG_ID_TAG" -f value -c name 2>/dev/null || echo "$SG_ID_TAG")
-        log "Deleting tagged Security Group $SG_NAME_TAG_DEL ($SG_ID_TAG)..."
-        openstack security group delete "$SG_ID_TAG" > /dev/null || log "Error: Failed to delete tagged SG $SG_ID_TAG"
-    done
+
+if openstack keypair show "$KEY_NAME" &>/dev/null; then
+    log "Deleting keypair $KEY_NAME"
+    openstack keypair delete "$KEY_NAME" || true
 fi
 
-if openstack keypair show "$KEY_NAME" > /dev/null 2>&1; then
-    log "Deleting keypair '$KEY_NAME'..."
-    openstack keypair delete "$KEY_NAME" > /dev/null || log "Error: Failed to delete keypair $KEY_NAME"
-else
-    log "Keypair '$KEY_NAME' not found."
-fi
+log "Removing local dynamic files…"
+for f in hosts.ini; do
+  if [ -f "$f" ]; then
+    rm -f "$f"
+    log "  Deleted $f"
+  fi
+done
 
-log "Cleanup for tag '$TAG' finished."
+log "Cleanup done. All resources for $TAG have been removed."

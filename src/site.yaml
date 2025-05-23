@@ -1,0 +1,186 @@
+---
+- name: Update apt cache on all hosts
+  hosts: all
+  become: yes
+  tasks:
+    - name: Update apt cache (Debian/Ubuntu)
+      apt:
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+
+# ------------------------------------------------------
+- name: Configure service nodes (nodes)
+  hosts: nodes
+  become: yes
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - python3
+          - python3-pip
+          - python3-flask
+          - snmpd
+        state: present
+        update_cache: yes
+
+    - name: Copy service.py to /opt/
+      copy:
+        src: service.py
+        dest: /opt/service.py
+        mode: '0755'
+
+    - name: Create systemd unit for service.py
+      copy:
+        dest: /etc/systemd/system/servicepy.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Custom Flask Service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=ubuntu
+          ExecStart=/usr/bin/python3 /opt/service.py
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd & start servicepy
+      systemd:
+        daemon_reload: yes
+        name: servicepy
+        state: restarted
+        enabled: yes
+
+    - name: Configure SNMPd to listen on UDP 6000 on all interfaces
+      lineinfile:
+        path: /etc/snmp/snmpd.conf
+        regexp: '^agentaddress\s+.*'
+        line: 'agentaddress udp:6000'
+      notify: Restart SNMPd
+
+    - name: Ensure snmpd is started and enabled
+      systemd:
+        name: snmpd
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Restart SNMPd
+      systemd:
+        name: snmpd
+        state: restarted
+
+# ------------------------------------------------------
+- name: Configure HAProxy on proxy host
+  hosts: proxy
+  become: yes
+  tasks:
+    - name: Install HAProxy and NGINX
+      apt: 
+        name: 
+          - haproxy
+          - nginx
+        state: present
+        update_cache: yes
+
+    - name: Configure HAProxy config
+      template:
+        src: haproxy.cfg.j2
+        dest: /etc/haproxy/haproxy.cfg
+        mode: '0644'
+      notify: Restart HAProxy
+
+    - name: Enable & start HAProxy
+      systemd:
+        name: haproxy
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    - name: Configure NGINX UDP
+      template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+        mode: '0644'
+        force: yes
+      notify: Reload NGINX
+
+    - name: Ensure NGINX is running
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+        daemon_reload: yes
+
+  handlers:
+    - name: Restart HAProxy
+      systemd:
+        name: haproxy
+        state: restarted
+
+    - name: Reload NGINX
+      systemd:
+        name: nginx
+        state: reloaded
+
+# ------------------------------------------------------
+- name: Configure Bastion host
+  hosts: bastion
+  become: yes
+  tasks:
+    - name: Install monitoring dependencies
+      apt:
+        name:
+          - python3
+          - python3-pip
+        state: present
+        update_cache: yes
+
+    - name: Install Python packages
+      pip:
+        name:
+          - flask
+          - ping3
+        executable: pip3
+
+    - name: Create nodes.txt with node IPs
+      template:
+        src: nodes.txt.j2
+        dest: /opt/nodes.txt
+        mode: '0644'
+
+    - name: Copy alive.py
+      copy:
+        src: alive.py
+        dest: /opt/alive.py
+        mode: '0755'
+
+    - name: Create systemd service for monitoring
+      copy:
+        dest: /etc/systemd/system/bastion-monitor.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Bastion Monitoring Service
+          After=network.target
+
+          [Service]
+          User=ubuntu
+          WorkingDirectory=/opt
+          ExecStart=/usr/bin/python3 /opt/alive.py
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start monitoring service
+      systemd:
+        name: bastion-monitor
+        daemon_reload: yes
+        state: restarted
+        enabled: yes
