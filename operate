@@ -1,26 +1,21 @@
 #!/bin/bash
 set -euo pipefail
-
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') $*"
 }
-
 if [[ $# -ne 3 ]]; then
     echo "Usage: $0 <openrc_file> <tag> <ssh_key_name>"
     exit 1
 fi
-
 OPENRC="$1"
 TAG="$2"
 KEY="$3"
 KEY_PRIV="$HOME/.ssh/$KEY"
-
 _bastion="${TAG}_bastion"
 _proxy="${TAG}_proxy"
 _node="${TAG}_node"
 _key="${KEY}"
 _sg_nodes="sg_nodes_${TAG}"
-
 if [ ! -f "$OPENRC" ]; then
     log "ERROR: OpenRC file $OPENRC not found."
     exit 1
@@ -29,17 +24,13 @@ if [ ! -f "$KEY_PRIV" ]; then
     log "ERROR: Private key $KEY_PRIV not found. Make sure it's in ~/.ssh/."
     exit 1
 fi
-
 source "$OPENRC"
-
 log "Starting operations for $TAG using $OPENRC for credentials."
-
 BASTION_FIP=""
 PROXY_FIP=""
 BASTION_INTERNAL_IP=""
 PROXY_INTERNAL_IP=""
 NET="${TAG}_network"
-
 wait_for_ssh() {
     ip="$1"
     timeout=180
@@ -60,20 +51,16 @@ wait_for_ssh() {
     log "  SSH is ready on $ip."
     return 0
 }
-
 wait_for_internal_ssh_from_bastion() {
     node_ip="$1"
     remote_timeout=180
     remote_interval=5
-    
     echo -n "  Initiating SSH wait from Bastion to $node_ip "
-    
     ssh -o StrictHostKeyChecking=no -i "$KEY_PRIV" ubuntu@"$BASTION_FIP" /bin/bash -s <<EOF >/dev/null
         node_ip_rem="${node_ip}"
         key_name_rem="${KEY}"
         timeout_rem="${remote_timeout}"
         interval_rem="${remote_interval}"
-        
         waited_rem=0
         while ! ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i ~/.ssh/"\$key_name_rem" ubuntu@"\$node_ip_rem" 'echo ok' >/dev/null 2>&1; do
             if [ "\$waited_rem" -ge "\$timeout_rem" ]; then
@@ -93,13 +80,11 @@ EOF
     log "  SSH wait from Bastion to $node_ip completed successfully."
     return 0
 }
-
 get_fips_and_internal_ips() {
     BASTION_FIP=""
     PROXY_FIP=""
     BASTION_INTERNAL_IP=""
     PROXY_INTERNAL_IP=""
-
     BASTION_FIP=$(openstack server show "$_bastion" -f value -c addresses | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | grep -vE '^(10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)' | head -1)
     if [[ -z "$BASTION_FIP" ]]; then
         log "ERROR: Could not find floating IP for Bastion server $_bastion. Is the instance running and associated with a FIP? Exiting."
@@ -112,24 +97,18 @@ get_fips_and_internal_ips() {
     fi
     BASTION_INTERNAL_IP=$(openstack server show "$_bastion" -f value -c addresses | grep "$NET" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
     PROXY_INTERNAL_IP=$(openstack server show "$_proxy" -f value -c addresses | grep "$NET" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
-    
     if [[ -z "$BASTION_INTERNAL_IP" ]]; then log "ERROR: Could not get internal IP for Bastion ($_bastion) on network $NET. Exiting."; exit 1; fi
     if [[ -z "$PROXY_INTERNAL_IP" ]]; then log "ERROR: Could not get internal IP for Proxy ($_proxy) on network $NET. Exiting."; exit 1; fi
-
     if [[ -z "${_FIPS_LOGGED_ONCE:-}" ]]; then
         log "Found essential IPs: Bastion FIP:$BASTION_FIP, Proxy FIP:$PROXY_FIP"
         _FIPS_LOGGED_ONCE=true
     fi
 }
-
 update_and_run_ansible() {
     log "Updating Ansible configuration on Bastion and running playbook..."
-
     INVENTORY_FILE="hosts.ini"
     echo "[nodes]" > "$INVENTORY_FILE"
-
     mapfile -t active_node_instances < <(openstack server list --long --status ACTIVE --name "$_node" -f value -c Name -c Networks)
-
     for line in "${active_node_instances[@]}"; do
         name=$(echo "$line" | awk '{print $1}')
         ip=$(echo "$line" | grep "$NET" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
@@ -137,34 +116,28 @@ update_and_run_ansible() {
             echo "$name ansible_host=$ip ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/$KEY ansible_python_interpreter=/usr/bin/python3" >> "$INVENTORY_FILE"
         fi
     done
-
     echo -e "\n[proxy]" >> "$INVENTORY_FILE"
     echo "$_proxy ansible_host=$PROXY_INTERNAL_IP ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/$KEY ansible_python_interpreter=/usr/bin/python3" >> "$INVENTORY_FILE"
-
     echo -e "\n[bastion]" >> "$INVENTORY_FILE"
     echo "$_bastion ansible_host=$BASTION_INTERNAL_IP ansible_user=ubuntu ansible_ssh_private_key_file=~/.ssh/$KEY ansible_python_interpreter=/usr/bin/python3" >> "$INVENTORY_FILE"
-
     echo -e "\n[all:children]" >> "$INVENTORY_FILE"
     echo "nodes" >> "$INVENTORY_FILE"
     echo "proxy" >> "$INVENTORY_FILE"
     echo "bastion" >> "$INVENTORY_FILE"
-
     log "Preparing Bastion for Ansible operations..."
     scp -o StrictHostKeyChecking=no -i "$KEY_PRIV" "$INVENTORY_FILE" ubuntu@"$BASTION_FIP":~ >/dev/null || { log "ERROR: Failed to copy hosts.ini."; exit 1; }
     ssh -o StrictHostKeyChecking=no -i "$KEY_PRIV" ubuntu@"$BASTION_FIP" "mkdir -p ~/.ssh/ && chmod 700 ~/.ssh/" >/dev/null || { log "ERROR: Failed to create .ssh dir on bastion."; exit 1; }
     scp -o StrictHostKeyChecking=no -i "$KEY_PRIV" "$KEY_PRIV" ubuntu@"$BASTION_FIP":~/.ssh/ >/dev/null || { log "ERROR: Failed to copy private key."; exit 1; }
     ssh -o StrictHostKeyChecking=no -i "$KEY_PRIV" ubuntu@"$BASTION_FIP" "chmod 600 ~/.ssh/$KEY" >/dev/null || { log "ERROR: Failed to set key permissions."; exit 1; }
     ssh -o StrictHostKeyChecking=no -i "$KEY_PRIV" ubuntu@"$BASTION_FIP" "
-        echo -e 'Host *\\n  StrictHostKeyChecking no\\n  UserKnownHostsFile=/dev/null' >> ~/.ssh/config
+        echo -e 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile=/dev/null' >> ~/.ssh/config
         chmod 600 ~/.ssh/config
     " >/dev/null || { log "ERROR: Failed to set SSH config on bastion."; exit 1; }
-
     scp -o StrictHostKeyChecking=no -i "$KEY_PRIV" src/site.yaml src/alive.py src/service.py ubuntu@"$BASTION_FIP":~ >/dev/null || { log "ERROR: Failed to copy main Ansible files."; exit 1; }
     ssh -o StrictHostKeyChecking=no -i "$KEY_PRIV" ubuntu@"$BASTION_FIP" "mkdir -p ~/templates/" >/dev/null || { log "ERROR: Failed to create templates dir on bastion."; exit 1; }
     scp -o StrictHostKeyChecking=no -i "$KEY_PRIV" src/haproxy.cfg.j2 src/nginx.conf.j2 src/nodes.txt.j2 ubuntu@"$BASTION_FIP":~/templates/ >/dev/null || { log "ERROR: Failed to copy templates."; exit 1; }
-
-    log "Bastion prepared and running Ansible playbook on Bastion..."
-
+    log "Bastion prepared."
+    log "Running Ansible playbook on Bastion..."
     ssh -o StrictHostKeyChecking=no -i "$KEY_PRIV" ubuntu@"$BASTION_FIP" "
         log_file='ansible_run.log'
         echo \"\$(date '+%Y-%m-%d %H:%M:%S') Starting Ansible playbook...\" > \"\$log_file\"
@@ -178,34 +151,28 @@ update_and_run_ansible() {
         fi
     "
     if [ $? -ne 0 ]; then
-      log "ERROR: Ansible playbook run on Bastion failed. Please check 'ansible_run.log' on $BASTION_FIP for details."
-      exit 1
+        log "ERROR: Ansible playbook run on Bastion failed. Please check 'ansible_run.log' on $BASTION_FIP for details."
+        exit 1
     fi
     log "Ansible playbook run complete."
 }
-
 get_fips_and_internal_ips
-
 log "Performing initial SSH checks for Bastion and Proxy Floating IPs (essential for operation)..."
 if ! wait_for_ssh "$BASTION_FIP"; then
-    log "FATAL ERROR: Bastion SSH not accessible via FIP. Cannot proceed."
+    log "ERROR: Bastion SSH not accessible via FIP. Cannot proceed."
     exit 1
 fi
 if ! wait_for_ssh "$PROXY_FIP"; then
     log "WARNING: Proxy SSH not directly accessible via FIP ($PROXY_FIP). If you need to SSH to proxy directly, please ensure it's accessible."
 fi
-
 while true; do
-    log "-----------------------------------------------------------------"
+    log "-------------------------------------------------------------------"
     log "Starting new operations cycle."
-
     N_NODES_CONFIG=$(head -n1 servers.conf 2>/dev/null || echo "3")
     DESIRED_NODES=${N_NODES_CONFIG:-3}
     log "Configuration requires: $DESIRED_NODES nodes."
-
     declare -A os_nodes_by_name
     mapfile -t os_server_lines < <(openstack server list --long --status ACTIVE --name "$_node" -f value -c Name -c Networks)
-
     for line in "${os_server_lines[@]}"; do
         name=$(echo "$line" | awk '{print $1}')
         ip=$(echo "$line" | grep "$NET" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
@@ -215,80 +182,65 @@ while true; do
             log "WARNING: Found server $name but could not extract valid internal IP on network $NET. Skipping it for os_nodes_by_name."
         fi
     done
-
-    get_fips_and_internal_ips 
-
+    get_fips_and_internal_ips
     declare -A bastion_alive_nodes_by_ip
     BASTION_STATUS_OUTPUT=$(ssh -o StrictHostKeyChecking=no -i "$KEY_PRIV" ubuntu@"$BASTION_FIP" "curl -s http://localhost:5000/" 2>/dev/null || echo "ERROR: Bastion service unreachable")
-    
     if [[ "$BASTION_STATUS_OUTPUT" == "ERROR: Bastion service unreachable" ]]; then
         log "WARNING: Could not connect to Bastion's Flask service for monitoring. Assuming 0 nodes are alive for this cycle. Retrying next cycle."
         CURRENT_AVAILABLE_NODES_COUNT=0
     else
         mapfile -t alive_ips < <(echo -e "$BASTION_STATUS_OUTPUT" | grep ':ALIVE' | cut -d':' -f1)
         CURRENT_AVAILABLE_NODES_COUNT=${#alive_ips[@]}
-        
         for ip_address in "${alive_ips[@]}"; do
             bastion_alive_nodes_by_ip["$ip_address"]="ALIVE"
         done
         log "Current status: $CURRENT_AVAILABLE_NODES_COUNT nodes available based on Bastion's monitoring."
     fi
-
     operational_node_names=()
     for name in "${!os_nodes_by_name[@]}"; do
-        ip="${os_nodes_by_name[$name]}" 
+        ip="${os_nodes_by_name[$name]}"
         if [[ -v "bastion_alive_nodes_by_ip[$ip]" && "${bastion_alive_nodes_by_ip[$ip]}" == "ALIVE" ]]; then
             operational_node_names+=("$name")
         fi
     done
-
     REDEPLOY_NEEDED=false
-
     if (( CURRENT_AVAILABLE_NODES_COUNT < DESIRED_NODES )); then
         NODES_TO_ADD=$((DESIRED_NODES - CURRENT_AVAILABLE_NODES_COUNT))
         log "Scaling up: Need to add $NODES_TO_ADD nodes."
-
-
         highest_node_num=0
         for name in "${!os_nodes_by_name[@]}"; do
-            node_num_str=$(echo "$name" | sed -E "s/^${_node}([0-9]+)$/\1/") 
+            node_num_str=$(echo "$name" | sed -E "s/^${_node}([0-9]+)$/\1/")
             if [[ "$node_num_str" =~ ^[0-9]+$ ]]; then
                 if (( node_num_str > highest_node_num )); then
                     highest_node_num=$node_num_str
                 fi
             fi
         done
-
         IMG_ID=$(openstack image list --status active -f value -c ID -c Name \
-                     | grep -i 'ubuntu' | grep '20.04' | sort -k2 | tail -n1 | awk '{print $1}')
+            | grep -i 'ubuntu' | grep '20.04' | sort -k2 | tail -n1 | awk '{print $1}')
         if [[ -z "$IMG_ID" ]]; then log "ERROR: Could not find a suitable Ubuntu 20.04 image. Cannot scale up. Exiting."; exit 1; fi
-        
         FLAVOR="b.1c2gb"
         BOOT_VOL_SIZE=10
-
         if ! openstack security group show "$_sg_nodes" >/dev/null 2>&1; then
             log "ERROR: Security group $_sg_nodes not found. Cannot scale up. Exiting."
             exit 1
         fi
-
         for i in $(seq 1 "$NODES_TO_ADD"); do
-            new_node_num=$((highest_node_num + i)) 
+            new_node_num=$((highest_node_num + i))
             NEW_NODE_NAME="${_node}${new_node_num}"
-            echo -n "Launching new nodes: $NEW_NODE_NAME, waiting for completion."        
-            echo
+            echo -n "Launching new node/s; $NEW_NODE_NAME, waiting for completion."
             VOL_NAME="${NEW_NODE_NAME}_vol"
             NEW_VOL_ID=$(openstack volume create \
-                          --size "$BOOT_VOL_SIZE" \
-                          --image "$IMG_ID" \
-                          --property tag="$TAG" \
-                          --description "$TAG disk for $NEW_NODE_NAME" \
-                          "$VOL_NAME" -f value -c id 2>/dev/null || true)
-            if [[ -z "$NEW_VOL_ID" ]]; then 
+                --size "$BOOT_VOL_SIZE" \
+                --image "$IMG_ID" \
+                --property tag="$TAG" \
+                --description "$TAG disk for $NEW_NODE_NAME" \
+                "$VOL_NAME" -f value -c id 2>/dev/null || true)
+            if [[ -z "$NEW_VOL_ID" ]]; then
                 log "ERROR: Failed to create volume for $NEW_NODE_NAME. Skipping this node."
                 echo
                 continue
             fi
-
             openstack server create \
                 --flavor "$FLAVOR" \
                 --key-name "$_key" \
@@ -305,16 +257,14 @@ while true; do
                 continue
             fi
             log "$NEW_NODE_NAME launched and active in OpenStack."
-
             NEW_NODE_INTERNAL_IP=$(openstack server show "$NEW_NODE_NAME" -f value -c addresses | grep "$NET" | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
             if [[ -z "$NEW_NODE_INTERNAL_IP" ]]; then
                 log "ERROR: Could not get internal IP for $NEW_NODE_NAME. It may not have connected to the network correctly. Skipping this node."
                 echo
                 continue
             fi
-
             if ! wait_for_internal_ssh_from_bastion "$NEW_NODE_INTERNAL_IP"; then
-                log "ERROR: SSH to $NEW_NODE_NAME ($NEW_NODE_INTERNAL_IP) from Bastion failed after creation."
+                log "FATAL ERROR: SSH to $NEW_NODE_NAME ($NEW_NODE_INTERNAL_IP) from Bastion failed after creation. Cannot proceed with Ansible for this node or further scaling/validation. Please check firewall rules/instance health."
                 openstack server delete "$NEW_NODE_NAME" >/dev/null 2>&1 || true
                 openstack volume delete "$NEW_VOL_ID" >/dev/null 2>&1 || true
                 exit 1
@@ -322,54 +272,44 @@ while true; do
             REDEPLOY_NEEDED=true
         done
         log "Done, nodes launched."
-
     elif (( CURRENT_AVAILABLE_NODES_COUNT > DESIRED_NODES )); then
-        NODES_TO_REMOVE=$((CURRENT_AVAILABLE_NODES_COUNT - DESIRED_NODES)) 
+        NODES_TO_REMOVE=$((CURRENT_AVAILABLE_NODES_COUNT - DESIRED_NODES))
         log "Scaling down: Need to remove $NODES_TO_REMOVE surplus nodes."
-        
         IFS=$'\n' sorted_operational_nodes=($(for node_name in "${operational_node_names[@]}"; do
             node_num_str=$(echo "$node_name" | sed -E "s/^${_node}([0-9]+)$/\1/")
             echo "$node_num_str $node_name"
         done | sort -rn | awk '{print $2}'))
         unset IFS
-
         nodes_to_terminate=()
         for node_name in "${sorted_operational_nodes[@]}"; do
             if [[ ${#nodes_to_terminate[@]} -ge $NODES_TO_REMOVE ]]; then break; fi
             nodes_to_terminate+=("$node_name")
         done
-        
         for node_name in "${nodes_to_terminate[@]}"; do
             log "Removing surplus node: $node_name."
-
             if ! openstack server show "$node_name" >/dev/null 2>&1; then
                 log "WARNING: Server $node_name not found in OpenStack. It might have already been removed. Skipping deletion of server and its volume."
                 REDEPLOY_NEEDED=true
                 continue
             fi
-
             VOL_TO_DELETE_ID=""
             SERVER_VOLS_JSON=$(openstack server show "$node_name" -f json -c volumes_attached 2>/dev/null || true)
             if command -v jq &>/dev/null; then
-              VOL_TO_DELETE_ID=$(echo "$SERVER_VOLS_JSON" | jq -r '.[0].id' 2>/dev/null || echo "")
+                VOL_TO_DELETE_ID=$(echo "$SERVER_VOLS_JSON" | jq -r '.[0].id' 2>/dev/null || echo "")
             else
-              VOL_TO_DELETE_ID=$(echo "$SERVER_VOLS_JSON" | grep -oP '"id": "\K[a-f0-9-]{36}' | head -1)
+                VOL_TO_DELETE_ID=$(echo "$SERVER_VOLS_JSON" | grep -oP '"id": "\K[a-f0-9-]{36}' | head -1)
             fi
-
             openstack server delete "$node_name" --wait >/dev/null
             if [ $? -ne 0 ]; then
-                log "WARNING: Failed to delete server $node_name. Skipping volume deletion."
+                log "WARNING: Failed to delete server $node_name. It might be in a bad state or already gone (after prior check). Skipping volume deletion."
                 continue
             fi
-
             if [[ -n "$VOL_TO_DELETE_ID" ]]; then
                 log "Found attached volume $VOL_TO_DELETE_ID for $node_name. Attempting to delete..."
                 openstack volume delete "$VOL_TO_DELETE_ID" >/dev/null 2>&1 || true
-
                 MAX_WAIT_TIME=120
                 WAIT_INTERVAL=5
                 ELAPSED_TIME=0
-
                 while openstack volume show "$VOL_TO_DELETE_ID" &>/dev/null && (( ELAPSED_TIME < MAX_WAIT_TIME )); do
                     STATUS=$(openstack volume show "$VOL_TO_DELETE_ID" -f value -c status 2>/dev/null || echo "not_found")
                     if [[ "$STATUS" == "deleting" || "$STATUS" == "in-use" ]]; then
@@ -383,14 +323,13 @@ while true; do
                     sleep "$WAIT_INTERVAL"
                     ELAPSED_TIME=$((ELAPSED_TIME + WAIT_INTERVAL))
                 done
-
                 if openstack volume show "$VOL_TO_DELETE_ID" &>/dev/null; then
                     log "WARNING: Volume $VOL_TO_DELETE_ID for $node_name did not delete within $MAX_WAIT_TIME seconds. Manual intervention may be required."
                 else
                     log "Volume deleted for $node_name: $VOL_TO_DELETE_ID."
                 fi
             else
-                log "Attempting to delete volume named '${node_name}_vol' directly as a fallback..."
+                log "Couldn't find attached volume ID for $node_name from server details. Attempting to delete volume named '${node_name}_vol' directly as a fallback..."
                 openstack volume delete "${node_name}_vol" >/dev/null 2>&1 || true
                 log "Volume cleanup attempt for '${node_name}_vol' done."
             fi
@@ -399,21 +338,16 @@ while true; do
         done
         log "Done, nodes removed."
     fi
-
     if $REDEPLOY_NEEDED; then
         log "Done, updating playbook and configuration."
         update_and_run_ansible
         log "Scaling actions completed and services re-configured."
-        log "Pausing for 10 seconds for API sync after scaling action..."
+        log "Pausing for 10 seconds for API synchronization after scaling action..."
         sleep 10
         continue
     fi
-
     log "Validating primary application functionality via Proxy."
     get_fips_and_internal_ips
-
     log "Sleeping for 30 seconds before next operations cycle."
     sleep 30
 done
-
-
