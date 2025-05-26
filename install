@@ -26,20 +26,66 @@ source "$OPENRC"
 
 log "Starting deployment of $TAG using $OPENRC for credentials."
 
-log "Checking if we have floating IP's availible."
+log "Checking for available floating IPs."
 EXT_NET=$(openstack network list --external -f value -c Name | head -n1)
-mapfile -t FIPS < <(openstack floating ip list --status DOWN --network "$EXT_NET" -f value -c Floating_IP_Address)
-NUMFIP=${#FIPS[@]}
-log "Found $NUMFIP floating IP's available."
-if [ $NUMFIP -lt 2 ]; then
-    for i in $(seq $((2 - NUMFIP))); do
-        openstack floating ip create "$EXT_NET" --tag "$TAG" >/dev/null
-    done
-    log "Allocating floating IP's 1, 2. Done"
-    mapfile -t FIPS < <(openstack floating ip list --status DOWN --network "$EXT_NET" -f value -c Floating_IP_Address)
+if [ -z "$EXT_NET" ]; then
+  log "ERROR: No external network found in OpenStack project. Cannot allocate floating IPs."
+  exit 1
 fi
-BASTION_FIP="${FIPS[0]}"
-PROXY_FIP="${FIPS[1]}"
+
+REQUIRED_FIPS=2
+BASTION_FIP=""
+PROXY_FIP=""
+declare -a SELECTED_FIPS=()
+
+log "Searching for FIPs tagged with '$TAG'..."
+mapfile -t TAGGED_FIPS < <(openstack floating ip list --status DOWN --network "$EXT_NET" -f value -c "Floating IP Address" --tag "$TAG")
+log "Found ${#TAGGED_FIPS[@]} FIPs already tagged with '$TAG' and are DOWN."
+
+for fip_addr in "${TAGGED_FIPS[@]}"; do
+    SELECTED_FIPS+=("$fip_addr")
+done
+
+log "Searching for any other untagged or differently-tagged FIPs..."
+mapfile -t ALL_DOWN_FIPS < <(openstack floating ip list --status DOWN --network "$EXT_NET" -f value -c "Floating IP Address")
+
+for potential_fip in "${ALL_DOWN_FIPS[@]}"; do
+    ALREADY_SELECTED=false
+    for selected in "${SELECTED_FIPS[@]}"; do
+        if [[ "$selected" == "$potential_fip" ]]; then
+            ALREADY_SELECTED=true
+            break
+        fi
+    done
+    if ! "$ALREADY_SELECTED"; then
+        SELECTED_FIPS+=("$potential_fip")
+    fi
+done
+
+NUM_AVAILABLE_FIPS=${#SELECTED_FIPS[@]}
+log "Total ${NUM_AVAILABLE_FIPS} unique floating IPs currently available in the project."
+
+if [ "$NUM_AVAILABLE_FIPS" -lt "$REQUIRED_FIPS" ]; then
+  ALLOCATED_COUNT=$((REQUIRED_FIPS - NUM_AVAILABLE_FIPS))
+  log "Need $ALLOCATED_COUNT more FIP. Allocating new ones and tagging with '$TAG'..."
+  declare -a NEWLY_ALLOCATED_FIPS=()
+  for i in $(seq 1 "$ALLOCATED_COUNT"); do
+    NEW_FIP=$(openstack floating ip create "$EXT_NET" --tag "$TAG" -f value -c "floating_ip_address")
+    log "Allocated: $NEW_FIP (tagged with $TAG)"
+    NEWLY_ALLOCATED_FIPS+=("$NEW_FIP")
+  done
+  SELECTED_FIPS=("${NEWLY_ALLOCATED_FIPS[@]}" "${SELECTED_FIPS[@]}")
+fi
+
+if [ "${#SELECTED_FIPS[@]}" -lt "$REQUIRED_FIPS" ]; then
+  log "ERROR: After all attempts, could not secure $REQUIRED_FIPS floating IPs. Only found the allocated ${#SELECTED_FIPS[@]}."
+  exit 1
+fi
+
+BASTION_FIP="${SELECTED_FIPS[0]}"
+PROXY_FIP="${SELECTED_FIPS[1]}"
+log "Selected Bastion Floating IP: $BASTION_FIP"
+log "Selected Proxy Floating IP: $PROXY_FIP"
 log "Done"
 
 log "Checking if we have ${TAG}_key available."
