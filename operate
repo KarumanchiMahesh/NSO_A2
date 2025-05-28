@@ -461,10 +461,11 @@ while true; do
             openstack volume delete "$NEW_VOL_ID" >/dev/null 2>&1 || true 
             continue
         fi
+        OPENSTACK_KEYPAIR_NAME="${TAG}_key"
         log "Volume $NEW_VOL_ID is available."
         openstack server create \
           --flavor "$FLAVOR" \
-          --key-name "$_key" \
+          --key-name "$OPENSTACK_KEYPAIR_NAME" \
           --network "$NET" \
           --security-group "$_sg_nodes" \
           --property tag="$TAG" \
